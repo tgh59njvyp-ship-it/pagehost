@@ -1,0 +1,6 @@
+{
+  "name": "PageHost",
+  "description": "Create, edit, preview, and instantly host HTML/CSS/JS pages. Powered by high-speed server rendering, dynamic visitor analytics, and AI-assisted generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

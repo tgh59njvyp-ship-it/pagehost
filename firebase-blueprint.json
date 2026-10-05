@@ -1,0 +1,99 @@
+{
+  "entities": {
+    "HostedPage": {
+      "title": "HostedPage",
+      "description": "Information about a hosted website or mock API on PageHost",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Title of the hosted website or mock API"
+        },
+        "description": {
+          "type": "string",
+          "description": "Description of the website or API endpoint"
+        },
+        "password": {
+          "type": "string",
+          "description": "Optional access password for private sites"
+        },
+        "views": {
+          "type": "integer",
+          "description": "Number of times the website or API has been loaded"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp of the deployment"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Latest update timestamp of the deployment"
+        },
+        "rootFile": {
+          "type": "string",
+          "description": "Entrypoint HTML file path, usually index.html"
+        },
+        "slug": {
+          "type": "string",
+          "description": "Custom URL path segment (e.g., quiz/home)"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "inactive"],
+          "description": "Active state of the server/hosting"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["site", "api"],
+          "description": "Distinction between an HTML page and a JSON Mock API"
+        },
+        "apiResponse": {
+          "type": "string",
+          "description": "JSON raw content response for mock API"
+        },
+        "apiMethod": {
+          "type": "string",
+          "description": "HTTP Method allowed for this mock API"
+        },
+        "envVariables": {
+          "type": "object",
+          "description": "Custom environment variables or third-party API Keys injected into the hosted website"
+        }
+      },
+      "required": ["title", "description", "views", "createdAt", "rootFile", "status", "type"]
+    },
+    "PageFile": {
+      "title": "PageFile",
+      "description": "A single static asset or file belonging to a hosted page",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative file path inside the hosting sandbox"
+        },
+        "content": {
+          "type": "string",
+          "description": "File text content or Base64 encoded data"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "base64"],
+          "description": "Type of the content encoding"
+        }
+      },
+      "required": ["path", "content", "type"]
+    }
+  },
+  "firestore": {
+    "/pages/{pageId}": {
+      "schema": "HostedPage",
+      "description": "Index collection of all hosted websites"
+    },
+    "/pages/{pageId}/files/{fileId}": {
+      "schema": "PageFile",
+      "description": "Subcollection holding files and assets for each hosted page"
+    }
+  }
+}
