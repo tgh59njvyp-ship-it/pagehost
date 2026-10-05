@@ -286,6 +286,77 @@ const INITIAL_JSON_API = `{
   }
 }`;
 
+function getMimeTypeFromExt(filePath: string): string {
+  const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp',
+    '.txt': 'text/plain; charset=utf-8',
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+function resolveRelativeAsset(pathStr: string, files: UploadedFilePayload[]): string | null {
+  if (!pathStr || pathStr.startsWith('http://') || pathStr.startsWith('https://') || pathStr.startsWith('data:') || pathStr.startsWith('/')) {
+    return null;
+  }
+  const normalizedPath = pathStr.replace(/^\.\//, '').replace(/\\/g, '/');
+  const found = files.find(f => {
+    const fPath = f.path.replace(/^\.\//, '').replace(/\\/g, '/');
+    return fPath === normalizedPath;
+  });
+  if (!found) return null;
+  const mimeType = getMimeTypeFromExt(normalizedPath);
+  if (found.type === 'base64') {
+    return `data:${mimeType};base64,${found.content}`;
+  } else {
+    const blob = new Blob([found.content], { type: mimeType });
+    return URL.createObjectURL(blob);
+  }
+}
+
+function getProcessedHtml(html: string, files: UploadedFilePayload[]): string {
+  if (!files || files.length === 0) return html;
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    doc.querySelectorAll('link[rel="stylesheet"]').forEach(el => {
+      const href = el.getAttribute('href');
+      if (href) {
+        const resolved = resolveRelativeAsset(href, files);
+        if (resolved) el.setAttribute('href', resolved);
+      }
+    });
+    doc.querySelectorAll('script[src]').forEach(el => {
+      const src = el.getAttribute('src');
+      if (src) {
+        const resolved = resolveRelativeAsset(src, files);
+        if (resolved) el.setAttribute('src', resolved);
+      }
+    });
+    doc.querySelectorAll('img[src], source[src], video[src], audio[src]').forEach(el => {
+      const src = el.getAttribute('src');
+      if (src) {
+        const resolved = resolveRelativeAsset(src, files);
+        if (resolved) el.setAttribute('src', resolved);
+      }
+    });
+    return doc.documentElement.outerHTML;
+  } catch (e) {
+    console.error("HTML parsing error in preview:", e);
+    return html;
+  }
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'canvas' | 'history' | 'templates' | 'docs' | 'settings'>('dashboard');
   const [htmlCode, setHtmlCode] = useState(INITIAL_HTML);
@@ -328,6 +399,7 @@ export default function App() {
   const [aiPrompt, setAiPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatingMessage, setGeneratingMessage] = useState('');
+  const [aiMode, setAiMode] = useState<'create' | 'improve'>('create');
 
   // Deploy state
   const [isDeploying, setIsDeploying] = useState(false);
@@ -344,6 +416,58 @@ export default function App() {
   const previewFrameRef = useRef<HTMLIFrameElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
+  // Console logs & debugging states
+  interface ConsoleLogItem {
+    timestamp: string;
+    level: 'info' | 'warn' | 'error';
+    message: string;
+  }
+  const [iframeLogs, setIframeLogs] = useState<ConsoleLogItem[]>([]);
+  const [showConsole, setShowConsole] = useState(true);
+  const [isErrorOverlayDismissed, setIsErrorOverlayDismissed] = useState(false);
+  const [hasDraft, setHasDraft] = useState(false);
+  const consoleBottomRef = useRef<HTMLDivElement>(null);
+
+  // Listen for iframe log messages
+  useEffect(() => {
+    const handleIframeMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'IFRAME_LOG') {
+        const newLog: ConsoleLogItem = {
+          timestamp: new Date().toLocaleTimeString(),
+          level: event.data.level,
+          message: event.data.message
+        };
+        setIframeLogs(prev => [...prev.slice(-99), newLog]);
+      }
+    };
+
+    window.addEventListener('message', handleIframeMessage);
+    return () => window.removeEventListener('message', handleIframeMessage);
+  }, []);
+
+  // Auto-scroll console to bottom when logs update
+  useEffect(() => {
+    if (showConsole && consoleBottomRef.current) {
+      consoleBottomRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [iframeLogs, showConsole]);
+
+  // Check for draft on load
+  useEffect(() => {
+    setHasDraft(!!localStorage.getItem('pagehost_draft'));
+  }, []);
+
+  // Auto-save draft
+  useEffect(() => {
+    if (activeTab === 'canvas') {
+      const draft = {
+        htmlCode, pageTitle, pageDesc, customSlug, deployType, apiMethod, apiResponse, envPairs
+      };
+      localStorage.setItem('pagehost_draft', JSON.stringify(draft));
+      setHasDraft(true);
+    }
+  }, [htmlCode, pageTitle, pageDesc, customSlug, deployType, apiMethod, apiResponse, envPairs, activeTab]);
+
   // Save system API Key to LocalStorage when changed
   useEffect(() => {
     localStorage.setItem('pagehost_system_gemini_key', systemGeminiKey);
@@ -354,18 +478,79 @@ export default function App() {
     if (activeTab === 'canvas' && deployType === 'site' && previewFrameRef.current) {
       const doc = previewFrameRef.current.contentDocument;
       if (doc) {
-        doc.open();
-        doc.write(htmlCode);
-        doc.close();
+        // Reset console logs and error overlay on new load
+        setIframeLogs([]);
+        setIsErrorOverlayDismissed(false);
 
-        if (editingId) {
-          const base = doc.createElement('base');
-          base.href = `${window.location.origin}/p/${editingId}/`;
-          doc.head.appendChild(base);
+        let processedHtml = getProcessedHtml(htmlCode, attachedFiles);
+
+        // Intercept and log iframe exceptions, console messages, and promise rejections
+        const loggerScript = `
+<script>
+  (function() {
+    function sendLog(level, args) {
+      const message = Array.from(args).map(arg => {
+        try {
+          return typeof arg === 'object' ? JSON.stringify(arg) : String(arg);
+        } catch(e) {
+          return String(arg);
         }
+      }).join(' ');
+      window.parent.postMessage({ type: 'IFRAME_LOG', level: level, message: message }, '*');
+    }
+
+    const _log = console.log;
+    const _warn = console.warn;
+    const _error = console.error;
+
+    console.log = function() {
+      sendLog('info', arguments);
+      _log.apply(console, arguments);
+    };
+    console.warn = function() {
+      sendLog('warn', arguments);
+      _warn.apply(console, arguments);
+    };
+    console.error = function() {
+      sendLog('error', arguments);
+      _error.apply(console, arguments);
+    };
+
+    window.onerror = function(message, source, lineno, colno, error) {
+      const errMsg = message + (lineno ? ' (Line ' + lineno + ':' + colno + ')' : '');
+      window.parent.postMessage({ type: 'IFRAME_LOG', level: 'error', message: errMsg }, '*');
+      return false;
+    };
+
+    window.onunhandledrejection = function(event) {
+      const errMsg = 'Unhandled Promise Rejection: ' + (event.reason ? (event.reason.message || event.reason) : event);
+      window.parent.postMessage({ type: 'IFRAME_LOG', level: 'error', message: errMsg }, '*');
+    };
+  })();
+</script>
+`;
+
+        let baseTag = '';
+        if (editingId && attachedFiles.length === 0) {
+          baseTag = `\n  <base href="${window.location.origin}/p/${editingId}/">`;
+        }
+
+        const injectScript = `${loggerScript}${baseTag}`;
+
+        if (processedHtml.includes('<head>')) {
+          processedHtml = processedHtml.replace('<head>', `<head>\n  ${injectScript}`);
+        } else if (processedHtml.includes('<body>')) {
+          processedHtml = processedHtml.replace('<body>', `<body>\n  ${injectScript}`);
+        } else {
+          processedHtml = injectScript + processedHtml;
+        }
+
+        doc.open();
+        doc.write(processedHtml);
+        doc.close();
       }
     }
-  }, [htmlCode, activeTab, previewKey, editingId, deployType]);
+  }, [htmlCode, activeTab, previewKey, editingId, deployType, attachedFiles]);
 
   // Sync index.html with attachedFiles if changed
   useEffect(() => {
@@ -582,6 +767,28 @@ export default function App() {
     }
   };
 
+  const handleRestoreDraft = () => {
+    const draftStr = localStorage.getItem('pagehost_draft');
+    if (!draftStr) return;
+    try {
+      const draft = JSON.parse(draftStr);
+      setHtmlCode(draft.htmlCode);
+      setPageTitle(draft.pageTitle);
+      setPageDesc(draft.pageDesc);
+      setCustomSlug(draft.customSlug);
+      setDeployType(draft.deployType);
+      setApiMethod(draft.apiMethod);
+      setApiResponse(draft.apiResponse);
+      setEnvPairs(draft.envPairs);
+      setPreviewKey(prev => prev + 1);
+      setActiveTab('canvas');
+      alert('ドラフトを復元しました。');
+    } catch (e) {
+      console.error('Failed to restore draft:', e);
+      alert('ドラフトの復元に失敗しました。');
+    }
+  };
+
   // Toggle page status on the fly
   const handleToggleStatus = async (id: string, currentStatus: 'active' | 'inactive') => {
     const nextStatus = currentStatus === 'active' ? 'inactive' : 'active';
@@ -724,14 +931,23 @@ export default function App() {
     if (!promptText.trim()) return;
 
     setIsGenerating(true);
-    setGeneratingMessage('デザインとUIレイアウトを再構成中...');
+    setGeneratingMessage(aiMode === 'create' ? 'AIが新しいUIシステムを構築中...' : 'デザインとUIレイアウトを再構成中...');
     
-    const messages = [
-      'HTMLコード構造を最適化中...',
-      'ホワイトテーマの洗練された余白をアライン中...',
-      '双方向のJavaScriptロジックをバグ修正中...',
-      '表示テストを実行し、最終調整中...'
-    ];
+    const messages = aiMode === 'create' 
+      ? [
+          'プロンプトの意図を分析中...',
+          '最適なセマンティックHTMLを設計中...',
+          'Tailwind CSS v4 のライトテーマUIコンポーネントを配置中...',
+          'インタラクティブなJavaScriptを実装中...',
+          'コードの整合性をテストし、最終仕上げ中...'
+        ]
+      : [
+          '現在のHTMLコード構造を解析中...',
+          '改善・リデザイン要件に適合中...',
+          '洗練されたライトテーマの余白と境界線を調整中...',
+          '双方向JavaScriptロジックを最適化中...',
+          '表示テストを実行し、最終調整中...'
+        ];
     
     let index = 0;
     const interval = setInterval(() => {
@@ -753,8 +969,8 @@ export default function App() {
         headers,
         body: JSON.stringify({ 
           prompt: promptText, 
-          html: deployType === 'site' ? htmlCode : undefined, 
-          isImprovement: deployType === 'site'
+          html: aiMode === 'improve' && deployType === 'site' ? htmlCode : undefined, 
+          isImprovement: aiMode === 'improve'
         }),
       });
 
@@ -924,6 +1140,15 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {activeTab === 'canvas' && hasDraft && !editingId && (
+              <button 
+                onClick={handleRestoreDraft}
+                className="px-3 py-1.5 bg-sky-50 hover:bg-sky-100 text-sky-700 text-xs font-semibold rounded-lg border border-sky-200 transition-colors cursor-pointer flex items-center gap-1.5 animate-pulse"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>ドラフト復元</span>
+              </button>
+            )}
             {activeTab === 'canvas' && (
               <div className="flex items-center gap-2">
                 {editingId && (
@@ -1386,9 +1611,21 @@ export default function App() {
                           <Sparkles className="w-3.5 h-3.5 text-neutral-800" />
                           <span>AI Assistant (Gemini v3.8 Flash)</span>
                         </span>
-                        <span className="text-[10px] text-neutral-400">
-                          {deployType === 'site' ? 'デザイン・機能自動記述' : 'JSONレスポンス構造の生成'}
-                        </span>
+                        
+                        <div className="flex bg-neutral-100 border border-neutral-200 rounded-lg p-0.5 text-[10px] font-bold">
+                          <button 
+                            onClick={() => setAiMode('create')}
+                            className={`px-2 py-0.5 rounded-md transition-all cursor-pointer ${aiMode === 'create' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-400 hover:text-neutral-600'}`}
+                          >
+                            新規作成
+                          </button>
+                          <button 
+                            onClick={() => setAiMode('improve')}
+                            className={`px-2 py-0.5 rounded-md transition-all cursor-pointer ${aiMode === 'improve' ? 'bg-white text-neutral-900 shadow-xs' : 'text-neutral-400 hover:text-neutral-600'}`}
+                          >
+                            現在のコードを改善
+                          </button>
+                        </div>
                       </div>
                       
                       <div className="relative">
@@ -1396,8 +1633,13 @@ export default function App() {
                           value={aiPrompt}
                           onChange={(e) => setAiPrompt(e.target.value)}
                           placeholder={deployType === 'site' 
-                            ? "どのようなサイトにしますか？ (例: 「ホワイト調の洗練されたクイズLPを作って」)" 
-                            : "どのようなAPIレスポンスにしますか？ (例: 「ダミーの製品データが10件入ったJSONを作って」)"}
+                            ? (aiMode === 'create' 
+                              ? "どのようなサイトにしますか？ (例: 「ホワイト調の洗練されたクイズLPを作って」)" 
+                              : "どのように改善・リデザインしますか？ (例: 「背景に薄いグレーのグリッドを追加して、タイトルの余白を広くして」)")
+                            : (aiMode === 'create'
+                              ? "どのようなAPIレスポンスにしますか？ (例: 「ダミーの製品データが10件入ったJSONを作って」)"
+                              : "どのようにJSONを改善・拡張しますか？ (例: 「各ユーザーにemailとcreatedAtのフィールドを追加して」)")
+                          }
                           rows={2}
                           className="w-full pr-12 pl-4 py-3 bg-white border border-neutral-200 rounded-xl text-neutral-800 text-xs placeholder:text-neutral-400 focus:outline-none focus:border-neutral-400 resize-none leading-relaxed shadow-none"
                         />
@@ -1428,13 +1670,112 @@ export default function App() {
                   </div>
 
                   {deployType === 'site' ? (
-                    <div className="flex-1 bg-white relative">
-                      <iframe 
-                        ref={previewFrameRef}
-                        title="PageHost Live Preview Sandbox"
-                        className="absolute inset-0 w-full h-full border-0 bg-white"
-                        sandbox="allow-scripts allow-modals allow-popups"
-                      />
+                    <div className="flex-1 bg-white relative flex flex-col min-h-0">
+                      <div className="flex-1 relative min-h-0">
+                        <iframe 
+                          ref={previewFrameRef}
+                          title="PageHost Live Preview Sandbox"
+                          className="absolute inset-0 w-full h-full border-0 bg-white"
+                          sandbox="allow-scripts allow-modals allow-popups"
+                        />
+                      </div>
+
+                      {/* Integrated Preview Error Overlay */}
+                      {iframeLogs.filter(l => l.level === 'error').length > 0 && !isErrorOverlayDismissed && (
+                        <div className="absolute inset-0 bg-neutral-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-20 animate-[fadeIn_0.15s_ease-out]">
+                          <div className="bg-white border border-neutral-200 w-full max-w-md rounded-2xl p-6 space-y-5 shadow-2xl flex flex-col max-h-[90%]">
+                            <div className="flex items-start gap-3">
+                              <div className="p-2 rounded-xl bg-rose-50 border border-rose-100 text-rose-600 shrink-0">
+                                <AlertCircle className="w-5 h-5" />
+                              </div>
+                              <div className="space-y-1">
+                                <h4 className="text-neutral-900 font-extrabold text-sm">プレビュー実行エラーを検出しました</h4>
+                                <p className="text-neutral-500 text-xs">HTML/JavaScriptの実行中にエラーが発生しました。以下が詳細なエラー内容です。</p>
+                              </div>
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto bg-neutral-50 border border-neutral-200 rounded-xl p-3 font-mono text-[11px] leading-relaxed text-rose-700 space-y-2 select-text">
+                              {iframeLogs.filter(l => l.level === 'error').map((err, i) => (
+                                <div key={i} className="flex gap-1.5 items-start">
+                                  <span className="text-rose-400 font-bold shrink-0">[{i+1}]</span>
+                                  <span className="break-all whitespace-pre-wrap">{err.message}</span>
+                                </div>
+                              ))}
+                            </div>
+
+                            <div className="flex flex-col sm:flex-row gap-2.5 text-xs font-bold shrink-0">
+                              <button 
+                                onClick={() => {
+                                  const errTexts = iframeLogs.filter(l => l.level === 'error').map(e => e.message).join('\n');
+                                  setAiPrompt(`現在、以下のプレビュー実行エラーが発生しています。原因を特定し、HTMLコードを修正・リデザインしてください。\n\n【発生中のエラー】\n${errTexts}`);
+                                  setAiMode('improve');
+                                  alert('AIの指示欄にエラーの修正リクエストをバインドしました。「AIを実行（Sparklesボタン）」を押して修正を依頼できます。');
+                                }}
+                                className="flex-1 py-2.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-lg flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                              >
+                                <Sparkles className="w-3.5 h-3.5" />
+                                <span>AIに修正を依頼する</span>
+                              </button>
+                              
+                              <button 
+                                onClick={() => setIsErrorOverlayDismissed(true)}
+                                className="px-4 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-600 rounded-lg cursor-pointer"
+                              >
+                                閉じる
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* Integrated Preview Debug Console */}
+                      <div className="border-t border-neutral-200 bg-white shrink-0 flex flex-col min-h-0">
+                        {/* Console Header bar */}
+                        <div className="h-9 bg-neutral-50 border-b border-neutral-200/60 px-4 flex items-center justify-between text-xs shrink-0 select-none">
+                          <div className="flex items-center gap-2">
+                            <Terminal className="w-3.5 h-3.5 text-neutral-500" />
+                            <span className="font-bold text-neutral-600">デバッグコンソール / ログ</span>
+                            {iframeLogs.filter(l => l.level === 'error').length > 0 && (
+                              <span className="px-1.5 py-0.5 bg-rose-50 border border-rose-200 text-rose-600 font-bold font-mono rounded text-[10px] animate-pulse">
+                                {iframeLogs.filter(l => l.level === 'error').length} エラー
+                              </span>
+                            )}
+                          </div>
+                          
+                          <div className="flex items-center gap-3">
+                            <button 
+                              onClick={() => setIframeLogs([])}
+                              className="text-[10px] text-neutral-400 hover:text-neutral-600 font-semibold cursor-pointer"
+                            >
+                              クリア
+                            </button>
+                            <button 
+                              onClick={() => setShowConsole(!showConsole)}
+                              className="text-[10px] text-neutral-500 hover:text-neutral-900 font-bold cursor-pointer"
+                            >
+                              {showConsole ? 'コンソールを閉じる ✕' : `コンソールを開く (${iframeLogs.length}件) ⚙`}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Console Log Area */}
+                        {showConsole && (
+                          <div className="overflow-y-auto p-3 font-mono text-[11px] leading-relaxed bg-[#FDFDFD] space-y-1 h-[140px] max-h-[140px] border-b border-neutral-200">
+                            {iframeLogs.length === 0 ? (
+                              <div className="text-center py-6 text-neutral-400 font-sans italic">ログはありません。JavaScript のエラーや console.log はここに表示されます。</div>
+                            ) : (
+                              iframeLogs.map((log, i) => (
+                                <div key={i} className={`flex items-start gap-2 border-b border-neutral-50 pb-1 ${log.level === 'error' ? 'text-rose-600 bg-rose-50/20 px-1' : log.level === 'warn' ? 'text-amber-600' : 'text-neutral-600'}`}>
+                                  <span className="text-neutral-400 text-[10px] select-none shrink-0">{log.timestamp}</span>
+                                  <span className="font-bold uppercase select-none text-[9px] px-1 rounded bg-neutral-100 border border-neutral-200 shrink-0">{log.level}</span>
+                                  <span className="flex-1 break-all whitespace-pre-wrap">{log.message}</span>
+                                </div>
+                              ))
+                            )}
+                            <div ref={consoleBottomRef} />
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ) : (
                     /* API Test and Tutorial Screen */
